@@ -247,22 +247,6 @@ real-world case (HTTP retry libraries — Stripe, AWS SDK, requests, fetch
 duplicates that differ in a single timestamp; we accept that as a
 known-acceptable miss rather than ship a fragile field-guesser.
 
-The TOCTOU race that "SELECT-then-INSERT" would create is closed by a
-**partial UNIQUE index** on `(vendor_hint, hash_exact) WHERE
-duplicate_of_id IS NULL` — see `alembic/versions/0003`. Two concurrent
-identical POSTs cannot both become primaries.
-
-### Three idempotency layers, not one
-Each layer catches a failure mode the others can't:
-
-| Layer | Failure it catches |
-| --- | --- |
-| `raw_events.hash_exact` partial UNIQUE | Vendor's HTTP layer retries the same body |
-| `*_events.raw_event_id UNIQUE` | Worker crashes mid-transaction; reaper hands the row back; second worker re-classifies — same content lands again |
-| `(vendor, external_ref)` upsert on entity tables | LLM returns the right entity ref but a different attribute snapshot — they still converge to one row |
-
-Single-layer designs (just hash, just entity uniqueness) all fail under at
-least one of these. Three layers is the minimum that covers the matrix.
 
 ### "Jump to latest, never roll back" for entity state
 Out-of-order arrival is normal: vendors retry, networks reorder, batches
@@ -311,7 +295,7 @@ without re-parsing the raw payload.
 ### Tech choices (last because they're swappable)
 - **Python + FastAPI + SQLAlchemy 2 + Pydantic** — a 3-hour build benefits more from the data/LLM ecosystem maturity than from raw performance gains we don't need yet.
 - **LangChain** — `with_structured_output(NormalizedEvent)` does the provider-agnostic JSON schema → tool-call wiring. Switching providers is a one-line change in `app/llm/__init__.py`.
-- **Anthropic Claude (Haiku 4.5 default)** — its tool-use schema honors JSON Schema `oneOf` + per-variant `required` fields faithfully, which is the contract our typed `NormalizedEvent` discriminated union depends on. We tried Gemini first (cheaper per token) but its `responseSchema` drops per-variant required fields on union schemas — Claude was the right call once strict-schema enforcement mattered. Default to Haiku for the cheap path; bump `LLM_MODEL` to a Sonnet/Opus id when accuracy needs more headroom.
+- **Anthropic Claude (Sonnet 4.5 default)** — its tool-use schema honors JSON Schema `oneOf` + per-variant `required` fields faithfully, which is the contract our typed `NormalizedEvent` discriminated union depends on. We tried Gemini first (cheaper per token) but its `responseSchema` drops per-variant required fields on union schemas — Claude was the right call once strict-schema enforcement mattered. Default to Haiku for the cheap path; bump `LLM_MODEL` to a Sonnet/Opus id when accuracy needs more headroom.
 - **Postgres-as-queue** — zero extra infra for the prototype; demonstrates the correct concurrency primitives. Replaced by SQS + DLQ in production (§4).
 
 ---
@@ -335,89 +319,3 @@ flowchart LR
     Workers --> CW
     Workers -.-> XRay[OTEL → X-Ray<br/>request traces]
 ```
-
-### Edge: API Gateway, not ALB
-Vendor webhooks need HMAC signature verification per vendor (with secret
-rotation in Secrets Manager). API Gateway has first-class request-validation
-and Lambda authorizers; ALB would push HMAC into the FastAPI app and
-duplicate every team's wheel. Throughput cap (10k RPS per region without
-a quota bump) is fine for a webhook ingest workload.
-
-### Compute: ECS Fargate for both API and worker
-Lambda is tempting for the API (cold starts irrelevant on warm traffic),
-but the worker holds an LLM call open for ~1–3 s — Lambda billing on
-sustained latency is worse than Fargate's per-vCPU-second pricing. Same
-runtime for both keeps deployment simple.
-
-### Queue: SQS Standard with one queue per vendor
-- **One SQS queue per vendor** (not one queue with FIFO MessageGroupId-per-vendor). FIFO caps at 300 TPS per group, which doesn't scale per-shipment because we don't know the shipment id until after classification — chicken-and-egg. Per-vendor queues sidestep both problems: each vendor scales independently, and within-vendor ordering is best-effort (the entity-level "jump to latest" guard already handles ordering correctly, so per-message FIFO isn't required).
-- **Visibility timeout** handles worker-crash recovery — no in-process reaper needed.
-- **DLQ at the LLM layer, not the receive layer.** A message can deserialize fine but fail downstream because the LLM timed out, hit a rate limit, or returned an unparseable response. After 3 LLM-side failures the worker explicitly publishes to the DLQ. This keeps the DLQ focused on real failures (bad payloads, prompt drift, novel vendor schemas) rather than transient infra noise.
-- DLQ visibility = `SELECT * FROM raw_events WHERE status = 'failed'` plus the SQS DLQ message body. No separate admin UI in v1; CloudWatch alarm on DLQ depth is the operator surface.
-
-### Storage: RDS Postgres only
-Entity store + raw payloads stay on Postgres (RDS) — same model as
-today, no separate object store. The `raw_events` table already holds
-the verbatim payload as JSONB so **prompt / model upgrades replay
-straight from the DB** (see §6 schema-evolution story). Adding S3 would
-be premature; revisit only if raw-payload retention starts dominating
-storage cost.
-
-### Observability: CloudWatch for metrics + logs, OTEL → X-Ray for traces
-Two distinct stacks doing distinct things:
-- **CloudWatch** — structured app logs (already JSON via `structlog`) and metrics (queue depth, p99 ingest latency, DLQ count, classification confidence histogram). Native to AWS, alarming included.
-- **OpenTelemetry** spans the request lifecycle (POST → SQS receive → LLM call → DB write). Exported to X-Ray (or Honeycomb/Datadog if the org standardizes there). Diagnoses tail latency that aggregate metrics can't.
-
-CloudWatch is operator-facing; OTEL is engineer-facing. Keeping them
-separate avoids the trap of stuffing trace data into CloudWatch metrics
-where the high cardinality blows up the bill.
-
-### Other production wiring
-- **Per-vendor schema fast paths**: once a (vendor, payload-shape) classification has been stable for N events, freeze it as a deterministic parser. LLM stays as the fallback for the long tail. Dramatically lowers token cost.
-- **Multi-key entity correlation**: a small `(vendor, alias, entity_id)` mapping table so the same logical shipment can be referenced by master BL early, house BL later, container number in some events — a real-world freight-forwarder pain point.
-
----
-
-## 6. Failure modes & DLQ semantics
-
-Two distinct failure surfaces, with two distinct names:
-
-| Status        | Meaning | Visible to claim queue? | Operator query |
-| ---           | --- | :---: | --- |
-| `pending`     | Queued, attempts may be 0..max-1 | yes | `WHERE status='pending'` (queue depth) |
-| `processing` | A worker holds it; reaper will reset if `locked_at` falls behind. | no | (in-flight) |
-| `processed`   | Done. | no | (done) |
-| `duplicate`   | Byte-identical to an earlier `pending`/`processed` row. | no | `WHERE status='duplicate'` (audit) |
-| `failed`      | **Terminal DLQ.** `attempts >= max_attempts` real LLM/persist failures. Operator must intervene (typically `POST /raw-events/{id}/retry` after fixing the prompt). | no | `WHERE status='failed'` |
-
-The crucial split: `attempts` is incremented **only by `mark_failed`**
-(real classify or persist failure), NOT by `claim_one`. A worker crash
-between claim and persist costs zero retry budget — the reaper resets
-the row to `pending` and the next claim is "free". This means the DLQ
-budget actually counts LLM-side failures, not deploys-during-active-jobs.
-
-Reaper window math: LLM client `timeout=30s × max_retries=2` ⇒ ~90s
-worst-case LLM, plus ~1s persist ⇒ ~100s in-flight. Default
-`worker_stale_lock_minutes=5` (300s) gives a 3× margin. **If you raise
-the LLM timeout, raise the reaper window in lockstep** — they're a pair.
-
----
-
-## 7. Schema evolution
-
-The system is event-sourced: `raw_events` is the journal, `*_events` is
-the typed event log, entity rows are projections. That makes most schema
-changes safer than they look — but only if you choose the right tool.
-
-| Change | What to do |
-| --- | --- |
-| Add an **optional** field to a payload variant | Just add it. JSONB readers tolerate the missing key on old rows; new events populate it from the LLM. No migration. |
-| Add a **mandatory** field (was optional, becoming required) | Old rows can violate the new contract. Either: backfill via the replay flow below, then tighten the schema; or accept that historical rows won't validate (read-only) and check on write only. |
-| Rename / split a field | Migration writes the new field from the old one in one tx; ship readers handling both for one release; drop the old field in the next. |
-| **Reclassify under a new prompt** | The replay flow: walk `raw_events` ASC by `received_at`, re-run the classifier into a **shadow** entity/event set, diff vs production, promote when satisfied. The verbatim payloads are still in `raw_events.payload` — that's why we keep them. The retry endpoint is the one-event version of the same flow. |
-| Bump the canonical-state vocabulary | Add the new state to `_PAYLOAD_BY_STATE` + a new payload variant; ship; then consider a backfill if you want historical rows reclassified. The `unclassified` bucket absorbs anything you don't reclassify. |
-
-What's **not** there yet: an explicit `events.schema_version` column. For
-the prototype, `_events.attributes` JSONB is permissive enough that
-additive evolution works without one. A v1 production system would add
-it the moment we ship a breaking change to a payload variant.
