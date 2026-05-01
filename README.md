@@ -137,38 +137,35 @@ sequenceDiagram
     participant V as Vendor
     participant API as FastAPI
     participant DB as Postgres
-    participant W as Worker (async loop)
-    participant LLM as Claude (LangChain)
+    participant W as Worker
+    participant LLM as Claude
 
-    V->>+API: POST /api/v1/webhooks/{vendor} (any JSON)
-    API->>API: compute hash_exact = SHA-256(canonical_json(payload))
-    API->>DB: INSERT raw_events (duplicate_of_id=NULL)<br/>ON CONFLICT (vendor_hint, hash_exact)<br/>WHERE duplicate_of_id IS NULL DO NOTHING<br/>RETURNING id
+    V->>API: POST /api/v1/webhooks/vendor with any JSON
+    API->>API: compute hash_exact = SHA-256 of canonical JSON
+    API->>DB: INSERT raw_events ON CONFLICT WHERE duplicate_of_id IS NULL DO NOTHING
 
-    alt new payload — INSERT won (RETURNING id)
+    alt INSERT won — new payload
         API-->>V: 202 {raw_event_id, duplicate: false}
-    else byte-identical retry — partial unique index blocked the INSERT
-        API->>DB: SELECT primary id WHERE vendor_hint=? AND hash_exact=?
-        API->>DB: INSERT raw_events (status='duplicate', duplicate_of_id=parent)
-        API-->>-V: 202 {raw_event_id, duplicate: true, duplicate_of: parent_id}
-        Note over W: duplicates skip the worker → no LLM cost
+    else INSERT blocked by partial UNIQUE — byte-identical retry
+        API->>DB: SELECT primary id by vendor_hint and hash_exact
+        API->>DB: INSERT raw_events with status duplicate and duplicate_of_id
+        API-->>V: 202 {raw_event_id, duplicate: true, duplicate_of: parent_id}
+        Note over W: duplicates skip the worker — no LLM cost
     end
 
-    Note over API,DB: The INSERT-then-conflict path is the atomic backstop:<br/>two concurrent identical POSTs cannot both become primaries because<br/>uq_raw_events_primary_per_hash (partial UNIQUE) admits only one.
+    Note over API,DB: Two concurrent identical POSTs cannot both become primaries —<br/>uq_raw_events_primary_per_hash partial UNIQUE admits only one.
 
     rect rgb(245, 245, 245)
         Note over W: worker loop, every WORKER_POLL_INTERVAL_S
-        W->>+DB: UPDATE ... FOR UPDATE SKIP LOCKED LIMIT 1<br/>(claim one 'pending' row)
+        W->>DB: UPDATE FOR UPDATE SKIP LOCKED LIMIT 1 — claim a pending row
         DB-->>W: claimed raw_event
-        W->>+LLM: classify(payload)
-        LLM-->>-W: typed NormalizedEvent (envelope + per-state payload)
-
-        Note over W,DB: persist_normalized — single transaction
-        W->>DB: BEGIN
-        W->>DB: UPSERT entity ON CONFLICT (vendor, external_ref)
-        W->>DB: INSERT *_events ON CONFLICT (raw_event_id) DO NOTHING
-        W->>DB: UPDATE entity SET current_state=…<br/>WHERE last_event_at IS NULL OR last_event_at < event_at
-        W->>DB: UPDATE raw_events SET status='processed'
-        W->>-DB: COMMIT
+        W->>LLM: classify payload
+        LLM-->>W: typed NormalizedEvent
+        Note over W,DB: persist_normalized in one transaction
+        W->>DB: UPSERT entity ON CONFLICT vendor, external_ref
+        W->>DB: INSERT *_events ON CONFLICT raw_event_id DO NOTHING
+        W->>DB: UPDATE entity SET current_state WHERE last_event_at IS NULL OR last_event_at < event_at
+        W->>DB: UPDATE raw_events SET status processed
     end
 ```
 
@@ -181,13 +178,13 @@ sequenceDiagram
     participant DB as Postgres
     participant R as Reaper
 
-    W->>DB: claim_one commits status='processing'
-    Note over W: worker crashes mid-LLM-call
-    Note over DB: row stuck at status='processing' (locked_at frozen)
+    W->>DB: claim_one commits status processing
+    Note over W: worker crashes mid LLM call
+    Note over DB: row stuck at status processing — locked_at frozen
 
-    R->>DB: every 60s, UPDATE raw_events SET status='pending'<br/>WHERE status='processing' AND locked_at < now() - 5min
+    R->>DB: every 60s — UPDATE raw_events SET status pending<br/>WHERE status processing AND locked_at older than 5 min
     DB-->>R: N rows recovered
-    Note over DB: row is back in the queue; next claim picks it up
+    Note over DB: row is back in the queue, next claim picks it up
 ```
 
 ### 3c. Read path
@@ -199,13 +196,13 @@ sequenceDiagram
     participant SVC as Service layer
     participant DB as Postgres
 
-    C->>+API: GET /api/v1/shipments/{id}  (or /invoices/{id})
-    API->>+SVC: get_shipment(session, id)
-    SVC->>DB: SELECT shipments WHERE id=?
-    SVC->>DB: SELECT shipment_events WHERE entity_id=? ORDER BY event_at
+    C->>API: GET /api/v1/shipments/{id} or /invoices/{id}
+    API->>SVC: get_shipment session, id
+    SVC->>DB: SELECT shipments WHERE id = ?
+    SVC->>DB: SELECT shipment_events WHERE entity_id = ? ORDER BY event_at
     DB-->>SVC: rows
-    SVC-->>-API: Shipment + ordered events
-    API-->>-C: ShipmentOut JSON
+    SVC-->>API: Shipment + ordered events
+    API-->>C: ShipmentOut JSON
 ```
 
 ### API endpoints
