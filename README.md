@@ -26,12 +26,12 @@ flowchart LR
     DB[(Postgres<br/>raw_events · shipments · invoices · *_events)]:::store
 
     V   -->|HTTPS POST webhook| API
-    OP  -->|HTTPS GET / POST retry| API
+    OP  -->|HTTPS GET or POST retry| API
     API -->|SQL · atomic INSERT, SELECT| DB
-    API -.->|HTTPS classify (retry path)| GEM
+    API -.->|HTTPS classify on retry path| GEM
 
     W   -->|SQL · SKIP LOCKED claim, upsert| DB
-    W   -.->|HTTPS classify (normal path)| GEM
+    W   -.->|HTTPS classify on normal path| GEM
 ```
 
 - **Vendor** — sends webhooks (any JSON shape) over HTTPS to the API.
@@ -179,13 +179,13 @@ sequenceDiagram
     autonumber
     participant W as Worker
     participant DB as Postgres
-    participant R as Reaper (in-process, every 60s)
+    participant R as Reaper
 
-    W->>DB: claim_one() commits status='processing'
+    W->>DB: claim_one commits status='processing'
     Note over W: worker crashes mid-LLM-call
-    W--xDB: process dies; row stuck at status='processing'
+    Note over DB: row stuck at status='processing' (locked_at frozen)
 
-    R->>DB: UPDATE raw_events SET status='pending'<br/>WHERE status='processing' AND locked_at < now() - 5min
+    R->>DB: every 60s, UPDATE raw_events SET status='pending'<br/>WHERE status='processing' AND locked_at < now() - 5min
     DB-->>R: N rows recovered
     Note over DB: row is back in the queue; next claim picks it up
 ```
