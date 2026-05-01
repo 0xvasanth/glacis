@@ -30,8 +30,10 @@ services:
     command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
     environment:
       DATABASE_URL: postgresql+asyncpg://glacis:glacis@postgres:5432/glacis
+      LLM_PROVIDER: ${LLM_PROVIDER:-google}
       LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "8000:8000"
@@ -52,8 +54,10 @@ services:
     command: ["python", "-m", "app.workers.ingest_worker"]
     environment:
       DATABASE_URL: postgresql+asyncpg://glacis:glacis@postgres:5432/glacis
+      LLM_PROVIDER: ${LLM_PROVIDER:-google}
       LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:

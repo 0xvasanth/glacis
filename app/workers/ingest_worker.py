@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
@@ -27,18 +28,22 @@ logger = logging.getLogger(__name__)
 
 
 async def claim_one(session: AsyncSession, *, max_attempts: int) -> RawEvent | None:
-    """Atomic claim. Returns the locked RawEvent or None when nothing is pending."""
-    # FOR UPDATE SKIP LOCKED on the inner SELECT, then UPDATE the matched row.
-    # This is the canonical Postgres "atomic dequeue" recipe.
+    """Atomic claim. Returns the locked RawEvent or None when nothing is pending.
+
+    Note: `attempts` is NOT incremented here. A claim that ends in a process
+    crash should not consume retry budget — the reaper resets the row and the
+    next claim is "free". `attempts` is incremented only by `mark_failed`,
+    which fires on real classify / persist failures (LLM timeout, validation
+    error, etc.).
+    """
     stmt = text(
         """
         UPDATE raw_events
         SET status = 'processing',
-            locked_at = now(),
-            attempts = attempts + 1
+            locked_at = now()
         WHERE id = (
             SELECT id FROM raw_events
-            WHERE status = 'pending' AND attempts < :max_attempts
+            WHERE status = 'pending'
             ORDER BY received_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -50,20 +55,25 @@ async def claim_one(session: AsyncSession, *, max_attempts: int) -> RawEvent | N
     claimed_id = result.scalar_one_or_none()
     if claimed_id is None:
         return None
-
-    obj = await session.get(RawEvent, claimed_id)
-    return obj
+    return await session.get(RawEvent, claimed_id)
 
 
-async def mark_failed(raw_event_id, error: str) -> None:  # type: ignore[no-untyped-def]
-    """Reset a row to pending with error info; the next claim will retry."""
+async def mark_failed(raw_event_id: uuid.UUID, error: str, *, max_attempts: int) -> None:
+    """Record a real classify/persist failure.
+
+    Increments `attempts`. If the row reaches `max_attempts`, it goes to the
+    terminal `failed` state — no longer claimable, surfaces in operator
+    queries (`SELECT * FROM raw_events WHERE status='failed'`). Otherwise
+    the row goes back to `pending` for another worker pass.
+    """
     async with session_scope() as session:
         row = await session.get(RawEvent, raw_event_id)
         if row is None:
             return
-        row.status = "pending"
+        row.attempts = (row.attempts or 0) + 1
         row.last_error = error[:2000]
         row.locked_at = None
+        row.status = "failed" if row.attempts >= max_attempts else "pending"
 
 
 async def reap_stale(settings: Settings) -> int:
@@ -110,7 +120,7 @@ async def process_one(classifier: SupportsClassify, settings: Settings) -> bool:
         result = await classifier.classify(payload)
     except Exception as exc:
         logger.exception("worker.classify_failed", extra={"raw_event_id": str(raw_id)})
-        await mark_failed(raw_id, f"classify: {exc!r}")
+        await mark_failed(raw_id, f"classify: {exc!r}", max_attempts=settings.worker_max_attempts)
         return True
 
     try:
@@ -122,7 +132,7 @@ async def process_one(classifier: SupportsClassify, settings: Settings) -> bool:
             await persist_normalized(session, row, result)
     except Exception as exc:
         logger.exception("worker.persist_failed", extra={"raw_event_id": str(raw_id)})
-        await mark_failed(raw_id, f"persist: {exc!r}")
+        await mark_failed(raw_id, f"persist: {exc!r}", max_attempts=settings.worker_max_attempts)
         return True
 
     logger.info(

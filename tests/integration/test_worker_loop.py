@@ -36,7 +36,8 @@ async def test_claim_one_picks_pending_and_marks_processing():
         assert claimed is not None
         assert claimed.id == raw.id
         assert claimed.status == "processing"
-        assert claimed.attempts == 1
+        # attempts is NOT incremented on claim — only on real LLM/persist failure.
+        assert claimed.attempts == 0
 
 
 async def test_claim_one_returns_none_when_no_pending():
@@ -44,11 +45,27 @@ async def test_claim_one_returns_none_when_no_pending():
         assert await claim_one(session, max_attempts=5) is None
 
 
-async def test_claim_one_skips_rows_at_max_attempts():
+async def test_claim_one_does_NOT_skip_rows_with_high_attempts():
+    """`attempts` only gates membership in the failed/DLQ status now, not claim
+    eligibility. A pending row with attempts==max_attempts-1 is still claimable
+    (a worker crash on the previous try shouldn't burn budget)."""
     raw = await _seed_pending({"x": 1})
     async with session_scope() as session:
         re = await session.get(RawEvent, raw.id)
         assert re is not None
+        re.attempts = 4  # many prior failures, still under 5
+    async with session_scope() as session:
+        claimed = await claim_one(session, max_attempts=5)
+        assert claimed is not None and claimed.id == raw.id
+
+
+async def test_claim_one_skips_terminal_failed_rows():
+    """Rows in the terminal 'failed' DLQ are invisible to the claim queue."""
+    raw = await _seed_pending({"x": 1})
+    async with session_scope() as session:
+        re = await session.get(RawEvent, raw.id)
+        assert re is not None
+        re.status = "failed"
         re.attempts = 5
     async with session_scope() as session:
         assert await claim_one(session, max_attempts=5) is None
@@ -92,7 +109,7 @@ async def test_process_one_calls_classifier_and_persists_shipment():
         assert ships[0].current_state == "PICKED_UP"
 
 
-async def test_classifier_failure_marks_pending_with_error():
+async def test_classifier_failure_marks_pending_with_error_until_max_attempts():
     raw = await _seed_pending({"x": 1})
 
     class BoomClassifier:
@@ -100,15 +117,27 @@ async def test_classifier_failure_marks_pending_with_error():
             raise RuntimeError("LLM exploded")
 
     settings = get_settings()
+    settings.worker_max_attempts = 3
+
+    # First two failures → status='pending', attempts climbs.
+    for expected_attempts in (1, 2):
+        did = await process_one(BoomClassifier(), settings)  # type: ignore[arg-type]
+        assert did is True
+        async with session_scope() as session:
+            re = await session.get(RawEvent, raw.id)
+            assert re is not None
+            assert re.status == "pending"
+            assert re.attempts == expected_attempts
+            assert "LLM exploded" in (re.last_error or "")
+
+    # Third failure trips the DLQ — terminal 'failed' status.
     did = await process_one(BoomClassifier(), settings)  # type: ignore[arg-type]
     assert did is True
-
     async with session_scope() as session:
         re = await session.get(RawEvent, raw.id)
         assert re is not None
-        assert re.status == "pending"
-        assert re.attempts == 1
-        assert "LLM exploded" in (re.last_error or "")
+        assert re.status == "failed"
+        assert re.attempts == 3
 
 
 async def test_reaper_recovers_stuck_processing_rows():
@@ -213,22 +242,21 @@ async def test_process_one_with_classifier_validation_error_marks_pending():
         assert "transport_doc_number" in (re.last_error or "")
 
 
-async def test_max_attempts_parks_row_in_dlq():
-    """After max_attempts retries, the row stays at status='pending' with
-    attempts==max but is no longer claimed (effectively a DLQ)."""
+async def test_failed_status_is_invisible_to_claim_queue():
+    """The terminal 'failed' status is the operator-visible DLQ — searchable
+    via SELECT * FROM raw_events WHERE status='failed' and not claimable."""
     raw = await _seed_pending({"x": 1})
     async with session_scope() as session:
         re = await session.get(RawEvent, raw.id)
         assert re is not None
-        re.attempts = 5  # already at max
+        re.status = "failed"
+        re.attempts = 5
 
-    # Even with one pending row in the table, claim returns None because of WHERE attempts < max.
     async with session_scope() as session:
         assert await claim_one(session, max_attempts=5) is None
-    # The row is still there for diagnostics.
     async with session_scope() as session:
         re = await session.get(RawEvent, raw.id)
-        assert re is not None and re.status == "pending" and re.attempts == 5
+        assert re is not None and re.status == "failed" and re.attempts == 5
 
 
 async def test_two_events_same_entity_via_worker_link_to_one_shipment():

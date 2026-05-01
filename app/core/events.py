@@ -18,14 +18,18 @@ class _PayloadBase(BaseModel):
 
     Every payload carries an `extras` bag — a free-form dict where the LLM
     can stash any vendor-specific fields the payload contained that don't
-    map cleanly onto our typed schema. We keep this so no source data is
-    lost in normalization; downstream systems can query `extras` later
-    without reparsing the raw event. Use sparingly for shipment/invoice
-    payloads (most useful info is already typed); for UNCLASSIFIED it is
-    the primary place vendor data lands.
+    map cleanly onto our typed schema.
+
+    `extra="ignore"`: unknown top-level fields the LLM occasionally adds
+    (a stray `reason` on a non-UNCLASSIFIED payload, a misspelled key,
+    null-as-string for an unmodeled field) are silently dropped instead of
+    failing the whole classification. Required typed fields are still
+    enforced, so missing data still surfaces as a clear ValidationError.
+    The intent is: model the LLM as a noisy upstream, not as code we
+    control.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     extras: dict[str, Any] = Field(
         default_factory=dict,
@@ -202,7 +206,7 @@ EventPayload = Annotated[
 class NormalizedEvent(BaseModel):
     """The strict event our platform persists."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     vendor: str = Field(
         min_length=1,

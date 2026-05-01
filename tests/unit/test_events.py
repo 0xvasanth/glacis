@@ -176,16 +176,23 @@ def test_invoice_amount_must_be_non_negative():
         )
 
 
-def test_extra_fields_on_typed_payload_are_rejected():
-    """`extra=forbid` catches the LLM smuggling unexpected fields through.
-    Genuine vendor-specific data should go in `extras`, not as new top-level
-    keys."""
-    with pytest.raises(ValidationError):
-        ShipmentPickedUpPayload(
-            vendor_milestone="received",
-            transport_doc_number="MAEU1",
-            unknown_field="oops",  # type: ignore[call-arg]
-        )
+def test_extra_fields_on_typed_payload_are_silently_dropped():
+    """`extra="ignore"`: unknown top-level fields the LLM occasionally adds
+    are silently dropped instead of failing the whole classification.
+    Required typed fields are still enforced (covered by the per-state
+    'requires X' tests above) — this only relaxes the *unknown-field*
+    behavior. Genuine vendor-specific data should still go in `extras`."""
+    p = ShipmentPickedUpPayload.model_validate(
+        {
+            "vendor_milestone": "received",
+            "transport_doc_number": "MAEU1",
+            "unknown_field": "oops",  # would have failed under extra=forbid
+            "another_noise_field": 42,
+        }
+    )
+    assert p.transport_doc_number == "MAEU1"
+    assert not hasattr(p, "unknown_field")
+    assert not hasattr(p, "another_noise_field")
 
 
 def test_envelope_requires_event_at_and_vendor():

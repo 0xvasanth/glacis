@@ -85,7 +85,15 @@ async def persist_normalized(
 
     event_at = _ensure_utc(event.event_at)
     state = event.canonical_state
-    vendor = event.vendor or raw_event.vendor_hint
+    # Canonicalize the entity's vendor on `vendor_hint` (URL path, operator-controlled)
+    # rather than the LLM-extracted `event.vendor` (free-text, non-deterministic).
+    # Two webhooks for the same logical entity that arrive at the same URL path
+    # MUST converge to one row even if the LLM picks a different vendor string
+    # each time (e.g. "globalfreightpay" vs "HLAG" vs "globalfreightpay.api"
+    # for a payload with both `source` and `carrier` fields).
+    # The LLM-extracted vendor is still preserved in the event's `attributes`
+    # via the typed payload dump, so it remains queryable for analytics.
+    vendor = raw_event.vendor_hint
     attributes = _event_attributes(event)
 
     if isinstance(event.payload, _ShipmentPayloadBase):

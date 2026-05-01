@@ -23,9 +23,9 @@ async def _client() -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
 
 
-async def _new_raw(payload: dict) -> RawEvent:
+async def _new_raw(payload: dict, vendor_hint: str = "v") -> RawEvent:
     async with session_scope() as session:
-        re = RawEvent(payload=payload, vendor_hint="v", hash_exact=canonical_hash(payload))
+        re = RawEvent(payload=payload, vendor_hint=vendor_hint, hash_exact=canonical_hash(payload))
         session.add(re)
         await session.flush()
         await session.refresh(re)
@@ -34,8 +34,8 @@ async def _new_raw(payload: dict) -> RawEvent:
 
 async def _seed_shipment_with_two_events():
     """Seed one shipment with PICKED_UP then IN_TRANSIT."""
-    raw1 = await _new_raw({"event_msg_id": "S1"})
-    raw2 = await _new_raw({"event_msg_id": "S2"})
+    raw1 = await _new_raw({"event_msg_id": "S1"}, vendor_hint="MAEU")
+    raw2 = await _new_raw({"event_msg_id": "S2"}, vendor_hint="MAEU")
     t1 = datetime(2026, 4, 19, 11, 0, tzinfo=UTC)
     t2 = datetime(2026, 4, 21, 14, 47, tzinfo=UTC)
     base = shipment_event("PICKED_UP", t1, transport_doc_number="MAEU-API-1")
@@ -48,8 +48,10 @@ async def _seed_shipment_with_two_events():
 
 
 async def _seed_invoice_with_two_events():
-    raw1 = await _new_raw({"doc_ref": "INV-API-1", "kind": "issued"})
-    raw2 = await _new_raw({"doc_ref": "INV-API-1", "kind": "paid"})
+    raw1 = await _new_raw(
+        {"doc_ref": "INV-API-1", "kind": "issued"}, vendor_hint="globalfreightpay"
+    )
+    raw2 = await _new_raw({"doc_ref": "INV-API-1", "kind": "paid"}, vendor_hint="globalfreightpay")
     t_issued = datetime(2026, 4, 15, tzinfo=UTC)
     t_paid = datetime(2026, 4, 22, tzinfo=UTC)
     issued = invoice_issued(t_issued, document_reference="INV-API-1")

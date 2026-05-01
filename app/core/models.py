@@ -63,9 +63,11 @@ class RawEvent(Base):
             postgresql_where=text("status = 'pending'"),
         ),
         Index(
-            "ix_raw_events_hash_exact_vendor",
+            "uq_raw_events_primary_per_hash",
             "vendor_hint",
             "hash_exact",
+            unique=True,
+            postgresql_where=text("duplicate_of_id IS NULL"),
         ),
     )
 

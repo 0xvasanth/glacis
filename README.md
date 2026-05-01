@@ -6,7 +6,44 @@ persists them with full idempotency and out-of-order safety.
 
 ---
 
-## 1. Data model
+## 1. Components
+
+Six boxes — what each one does and how they talk.
+
+```mermaid
+flowchart LR
+    classDef ext fill:#fff5e6,stroke:#d68900,stroke-width:2px,color:#000
+    classDef proc fill:#e8f4ff,stroke:#1f6feb,stroke-width:2px,color:#000
+    classDef store fill:#e8ffe8,stroke:#2da043,stroke-width:2px,color:#000
+
+    V([Vendor]):::ext
+    OP([Operator]):::ext
+    GEM([Gemini API]):::ext
+
+    API[API processor<br/>FastAPI · ingest + read + retry]:::proc
+    W[Worker processor<br/>async loop · classify + persist + reaper]:::proc
+
+    DB[(Postgres<br/>raw_events · shipments · invoices · *_events)]:::store
+
+    V   -->|HTTPS POST webhook| API
+    OP  -->|HTTPS GET / POST retry| API
+    API -->|SQL · atomic INSERT, SELECT| DB
+    API -.->|HTTPS classify (retry path)| GEM
+
+    W   -->|SQL · SKIP LOCKED claim, upsert| DB
+    W   -.->|HTTPS classify (normal path)| GEM
+```
+
+- **Vendor** — sends webhooks (any JSON shape) over HTTPS to the API.
+- **Operator** — humans / internal services that read entities and trigger manual retries.
+- **API processor** — FastAPI. Thin request path: hash + atomic INSERT to dedupe, return 202 in <100 ms. Also serves entity reads and the synchronous retry endpoint.
+- **Worker processor** — asyncio loop. Claims pending rows from Postgres with `FOR UPDATE SKIP LOCKED`, calls Gemini, persists the typed event in one transaction. A stale-claim reaper inside the same process recovers rows from worker crashes.
+- **Gemini API** — the LLM that classifies + normalizes the payload. Called by the worker on the normal path and by the API on the retry path.
+- **Postgres** — the single shared dependency. All concurrency control (atomic claim, dedup, ordering guard) lives here as constraints + `SKIP LOCKED`, not as application-level locks.
+
+---
+
+## 2. Data model
 
 Five tables. `raw_events` is the durable inbox; `shipments` / `invoices`
 hold the latest state per entity; `*_events` keep the full audit history.
@@ -86,13 +123,13 @@ lands in history but does NOT regress current state.
 
 ---
 
-## 2. Flow
+## 3. Flow
 
 The split (api / worker / reaper) is the central design move: the request
 path is one INSERT and returns 202 well under 100 ms even though LLM calls
 take 1–3 s.
 
-### 2a. Webhook ingest + asynchronous classification
+### 3a. Webhook ingest + asynchronous classification
 
 ```mermaid
 sequenceDiagram
@@ -105,16 +142,18 @@ sequenceDiagram
 
     V->>+API: POST /api/v1/webhooks/{vendor} (any JSON)
     API->>API: compute hash_exact = SHA-256(canonical_json(payload))
-    API->>DB: SELECT id FROM raw_events WHERE vendor_hint=? AND hash_exact=?
+    API->>DB: INSERT raw_events (duplicate_of_id=NULL)<br/>ON CONFLICT (vendor_hint, hash_exact)<br/>WHERE duplicate_of_id IS NULL DO NOTHING<br/>RETURNING id
 
-    alt no parent (new payload)
-        API->>DB: INSERT raw_events (status='pending')
+    alt new payload — INSERT won (RETURNING id)
         API-->>V: 202 {raw_event_id, duplicate: false}
-    else parent found (byte-identical retry)
+    else byte-identical retry — partial unique index blocked the INSERT
+        API->>DB: SELECT primary id WHERE vendor_hint=? AND hash_exact=?
         API->>DB: INSERT raw_events (status='duplicate', duplicate_of_id=parent)
         API-->>-V: 202 {raw_event_id, duplicate: true, duplicate_of: parent_id}
         Note over W: duplicates skip the worker → no LLM cost
     end
+
+    Note over API,DB: The INSERT-then-conflict path is the atomic backstop:<br/>two concurrent identical POSTs cannot both become primaries because<br/>uq_raw_events_primary_per_hash (partial UNIQUE) admits only one.
 
     rect rgb(245, 245, 245)
         Note over W: worker loop, every WORKER_POLL_INTERVAL_S
@@ -133,7 +172,7 @@ sequenceDiagram
     end
 ```
 
-### 2b. Crash recovery (stale-claim reaper)
+### 3b. Crash recovery (stale-claim reaper)
 
 ```mermaid
 sequenceDiagram
@@ -151,7 +190,7 @@ sequenceDiagram
     Note over DB: row is back in the queue; next claim picks it up
 ```
 
-### 2c. Read path
+### 3c. Read path
 
 ```mermaid
 sequenceDiagram
@@ -173,99 +212,212 @@ sequenceDiagram
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/v1/webhooks/{vendor}` | Accept any JSON. Dedupes by content hash; returns `202 {raw_event_id, duplicate, duplicate_of}`. |
-| `GET`  | `/api/v1/shipments/{id}`     | Fetch a shipment with its full event history. |
-| `GET`  | `/api/v1/invoices/{id}`      | Fetch an invoice with its full event history. |
-| `GET`  | `/healthz`                   | Liveness + DB reachability. |
+| `POST` | `/api/v1/webhooks/{vendor}`              | Accept any JSON. Dedupes by content hash; returns `202 {raw_event_id, duplicate, duplicate_of}`. |
+| `GET`  | `/api/v1/shipments/{id}`                 | Fetch a shipment with its full event history. |
+| `GET`  | `/api/v1/invoices/{id}`                  | Fetch an invoice with its full event history. |
+| `POST` | `/api/v1/raw-events/{id}/retry`          | **Operator-triggered retry.** Synchronously re-runs LLM classification + persistence for a single `raw_event_id`. Locks the row so the worker's `SKIP LOCKED` claim passes over it. `404` if id unknown, `409` if row is a duplicate or already processed, `502` if the LLM call fails (row reset to `pending` for a future retry), `200` with `{status, attempts, canonical_state, entity_type, last_error}` on success. |
+| `GET`  | `/healthz`                               | Liveness + DB reachability. |
 
 The OpenAPI spec is exposed at `/docs` (Swagger UI) and `/openapi.json`.
 
 ---
 
-## 3. Decisions
+## 4. Decisions
 
-The "why" behind each major choice, with the trade-offs I weighed.
+The architectural choices, in order of how much they shape the rest of the
+system. Tech-stack picks come last — they're the easiest to swap.
 
-### Language: Python (over the alternative TypeScript)
-The role brief listed Python or JavaScript. I picked Python for two
-reasons: the data / LLM ecosystem is wider and more mature (Pydantic,
-SQLAlchemy 2 async, LangChain), and structured-output handling on the LLM
-side is simpler to reason about. JavaScript would have worked but I'd be
-fighting more of the boilerplate.
+### Split the request path from the LLM path
+The single most consequential decision. Vendors expect sub-second ack; LLM
+calls take 1–3 s. Putting the LLM in the request path violates the SLA on
+every webhook. Splitting them lets the API endpoint stay at one INSERT
+returning `202`, while the worker absorbs latency, retries, and crashes
+asynchronously. The cost: an extra durable queue (Postgres-as-queue here).
+Worth it — the alternative is HTTP timeouts back to the vendor.
 
-A personal aside: for a real production system at this layer I'd reach
-for **Rust** — millisecond-tier latency on the worker, deterministic
-memory, and zero runtime surprises around the DB connection pool. I've
-been writing **Cogniz**, a Rust LLM library that plays the same role as
-LangChain (provider-agnostic chat models, structured output, agentic
-patterns), specifically because I want this option in production. For
-this 3-hour scope Python pulls ahead on raw delivery speed — batteries
-included, less code to read, and the win from Rust here is mostly about
-scale we don't need yet.
+### Hash-based dedup, not vendor-id-based
+Vendors put event identifiers in different fields (`event_msg_id`,
+`event_id`, `advisory_id`, none-at-all), and some put **entity-level** IDs
+(`doc_ref`) that are stable across events for the same entity. A
+field-name whitelist would silently drop genuine new events as duplicates
+the first time we hit a new vendor. SHA-256 of the canonical-form
+payload is vendor-agnostic, content-defined, and catches the dominant
+real-world case (HTTP retry libraries — Stripe, AWS SDK, requests, fetch
+— re-send byte-identical bodies on timeout/5xx). It misses semantic
+duplicates that differ in a single timestamp; we accept that as a
+known-acceptable miss rather than ship a fragile field-guesser.
 
-### LLM orchestration: LangChain
-- Provider-agnostic structured output (`with_structured_output(NormalizedEvent)`) — swapping Gemini for Anthropic / OpenAI is a one-line change.
-- Agentic / sub-agent patterns ready out of the box if we later need to chain (e.g. tool-call back to a vendor lookup).
-- Cuts the boilerplate for retry, prompt caching, and tool conversion.
+The TOCTOU race that "SELECT-then-INSERT" would create is closed by a
+**partial UNIQUE index** on `(vendor_hint, hash_exact) WHERE
+duplicate_of_id IS NULL` — see `alembic/versions/0003`. Two concurrent
+identical POSTs cannot both become primaries.
 
-### Model: Google Gemini 2.5 Flash
-- Better at strict JSON / YAML output than Claude or OpenAI at comparable cost — important when the entire contract with the LLM is a typed schema.
-- Cheaper per token, so retrying a flaky payload is affordable.
-- Caveat: Gemini's structured output enforces `enum` but not `const` (Pydantic emits `const` for single-value `Literal`s, which is what discriminator fields generate). Mitigation: a one-line reminder in the prompt listing the allowed `canonical_state` values verbatim.
+### Three idempotency layers, not one
+Each layer catches a failure mode the others can't:
 
-### Queue: Postgres `FOR UPDATE SKIP LOCKED` (over Redis / Kafka / SQS)
-- Zero extra infrastructure — one container in `docker-compose.yml`.
-- Demonstrates correct concurrency primitives (atomic claim, exactly-once-within-transaction semantics).
-- Stale-claim reaper handles worker-crash-mid-LLM-call without an external broker.
-- Production: I'd switch to AWS SQS + DLQ — see §4.
+| Layer | Failure it catches |
+| --- | --- |
+| `raw_events.hash_exact` partial UNIQUE | Vendor's HTTP layer retries the same body |
+| `*_events.raw_event_id UNIQUE` | Worker crashes mid-transaction; reaper hands the row back; second worker re-classifies — same content lands again |
+| `(vendor, external_ref)` upsert on entity tables | LLM returns the right entity ref but a different attribute snapshot — they still converge to one row |
 
-### Strict typed event schema (the LLM contract)
-- `NormalizedEvent` is an envelope (`vendor` / `event_at` / `confidence`) wrapping a typed `payload` that's a discriminated union of 9 per-state variants.
-- Each variant declares its OWN required vs optional fields; missing required fields produce a Pydantic ValidationError naming the exact field, which the worker parks in the DLQ with the message attached.
-- Every payload carries an `extras: dict[str, Any]` bag for vendor-specific fields we don't model — preserved verbatim so future analytics / downstream systems can read them without re-parsing the raw payload.
+Single-layer designs (just hash, just entity uniqueness) all fail under at
+least one of these. Three layers is the minimum that covers the matrix.
+
+### "Jump to latest, never roll back" for entity state
+Out-of-order arrival is normal: vendors retry, networks reorder, batches
+flush late. Two policies were on the table:
+
+  - Wait for events to arrive in canonical order (block out-of-order events).
+  - Always use the event with the highest `event_at` for `current_state`,
+    keep history of all events.
+
+We took the second. Reason: a delayed `IN_TRANSIT` retry arriving after we
+already learned `DELIVERED` should NOT undo the delivered fact. The audit
+log keeps the late event so nothing is lost. Implementation is a
+conditional `UPDATE ... WHERE last_event_at IS NULL OR last_event_at <
+$event_at` in the same transaction as the event insert — race-free.
+
+### Three tables per entity (raw / entity / events), not one
+A flat `raw_events` table with a `normalized_state` JSONB column would
+fit the same data, but loses two things: (a) the entity row as a
+materialized view of latest state — `SELECT * FROM shipments WHERE
+current_state = 'IN_TRANSIT'` becomes an index scan, not a JSONB search
+across a wide log; (b) the clean audit boundary between "what the vendor
+sent" (raw_events) and "what we've decided" (entities + events). The
+3-table cost is two foreign keys and a tiny upsert — cheap.
+
+`entity.attributes` is a **denormalized projection** of the latest event's
+payload — overwritten on each newer event, NOT an aggregate. The event
+log is the source of truth; the entity row is a cache of "what's true
+right now". A replay walks events in `event_at` order and overwrites
+`entity.attributes` with the highest-event's payload — exactly what
+`persist_normalized` does live, just batched.
+
+### Typed event union, not bag-of-attributes
+Earlier prototype had `attributes: dict[str, Any]` — schema-free, the
+LLM could put anything there, and consumers had to defensively re-parse.
+The current `NormalizedEvent` has an envelope around a discriminated
+union of 9 per-state payload classes. Each variant declares its
+**mandatory** fields (what the platform needs to act on the event) and
+**optional** ones (useful context to keep). Missing mandatory fields
+surface as a Pydantic ValidationError naming the exact field, which the
+worker parks in the DLQ — the operator sees what the LLM dropped.
+
+The `extras: dict` per payload is the lossless escape hatch — vendor
+fields we don't model land there verbatim so they're queryable later
+without re-parsing the raw payload.
+
+### Tech choices (last because they're swappable)
+- **Python + FastAPI + SQLAlchemy 2 + Pydantic** — a 3-hour build benefits more from the data/LLM ecosystem maturity than from raw performance gains we don't need yet.
+- **LangChain** — `with_structured_output(NormalizedEvent)` does the provider-agnostic JSON schema → tool-call wiring. Switching providers is a one-line change in `app/llm/__init__.py`.
+- **Google Gemini 2.5 Flash** — better at strict JSON/Decimal output than Claude or OpenAI at comparable cost, and much cheaper per token so retrying flaky payloads is affordable. Caveat: Gemini's structured output enforces JSON Schema `enum` but not `const`, and `const` is what Pydantic emits for single-value `Literal`s. Mitigation: the prompt explicitly lists the allowed `canonical_state` values; the test suite snapshot-asserts those listings stay in the prompt.
+- **Postgres-as-queue** — zero extra infra for the prototype; demonstrates the correct concurrency primitives. Replaced by SQS + DLQ in production (§4).
 
 ---
 
-## 4. Proposed production solution
-
-What I'd change to take this past prototype.
+## 5. Proposed production architecture
 
 ```mermaid
 flowchart LR
-    Vendor[Vendor] -->|HTTPS / HMAC| ALB[ALB / API Gateway]
-    ALB --> APIs[API service<br/>Python FastAPI on ECS]
-    APIs -->|"persist raw payload + SendMessage"| SQS[(SQS FIFO<br/>per-vendor message group)]
+    Vendor[Vendor] -->|HTTPS / HMAC| APIGW[API Gateway<br/>HMAC verification]
+    APIGW --> APIs[FastAPI<br/>ECS Fargate]
+    APIs -->|"persist raw_event + SendMessage"| SQS[(SQS Standard<br/>1 queue per vendor)]
     APIs --> RDS[(RDS Postgres<br/>raw_events + entities + event log)]
 
-    SQS --> Workers[Worker fleet<br/>Rust + Cogniz<br/>ECS Fargate / Lambda]
+    SQS --> Workers[Worker fleet<br/>ECS Fargate]
     Workers -->|classify| Gemini[Gemini API]
     Workers --> RDS
 
-    Workers -.->|"3 failed LLM attempts → mark DLQ"| DLQ[(SQS DLQ<br/>LLM-failed payloads)]
+    Workers -.->|"3 LLM-side failures"| DLQ[(SQS DLQ<br/>per source queue)]
 
-    Workers -. metrics / traces .-> Obs[CloudWatch + OTEL]
+    APIs --> CW[CloudWatch<br/>logs + metrics]
+    Workers --> CW
+    Workers -.-> XRay[OTEL → X-Ray<br/>request traces]
 ```
 
-### Queue: AWS SQS + DLQ
-The Postgres-as-queue pattern is a good demo but every production ingest
-pipeline I've built uses a managed broker. Concretely:
+### Edge: API Gateway, not ALB
+Vendor webhooks need HMAC signature verification per vendor (with secret
+rotation in Secrets Manager). API Gateway has first-class request-validation
+and Lambda authorizers; ALB would push HMAC into the FastAPI app and
+duplicate every team's wheel. Throughput cap (10k RPS per region without
+a quota bump) is fine for a webhook ingest workload.
 
-- **SQS FIFO** with one `MessageGroupId` per vendor (or per shipment / invoice when extracted) so per-entity ordering is preserved while throughput scales horizontally across groups.
-- **Visibility timeout** handles worker-crash recovery (the message becomes visible again automatically — no in-process reaper needed).
-- **DLQ trigger is at the LLM-processing layer, not message-receive.** A worker can claim a message and have it succeed at the framework level (deserialized fine) yet fail downstream because the LLM call timed out, hit a rate limit, or returned an unparseable response. We retry that classify+persist work up to 3 times; only after the third LLM-side failure does the worker explicitly move the payload to the DLQ. This keeps the DLQ focused on "real" failures (bad payloads, prompt drift, vendor schema we can't classify) rather than transient infra noise.
-- Native CloudWatch metrics on queue depth, age-of-oldest-message, DLQ count → wired straight into alerting.
+### Compute: ECS Fargate for both API and worker
+Lambda is tempting for the API (cold starts irrelevant on warm traffic),
+but the worker holds an LLM call open for ~1–3 s — Lambda billing on
+sustained latency is worse than Fargate's per-vCPU-second pricing. Same
+runtime for both keeps deployment simple.
 
-### Compute: Rust workers (with Cogniz)
-- The throughput needle moves on the **worker** side, not the API. Latency-sensitive paths (poll → claim → LLM client → DB write) benefit from Rust's predictability and lower per-task memory.
-- **Cogniz** (my Rust LLM library — provider abstraction, structured output, agentic patterns) plays the same role here that LangChain plays in the prototype.
-- The API layer can stay in Python (FastAPI is fine for 100ms/req) — the interesting performance work is in the worker fleet.
+### Queue: SQS Standard with one queue per vendor
+- **One SQS queue per vendor** (not one queue with FIFO MessageGroupId-per-vendor). FIFO caps at 300 TPS per group, which doesn't scale per-shipment because we don't know the shipment id until after classification — chicken-and-egg. Per-vendor queues sidestep both problems: each vendor scales independently, and within-vendor ordering is best-effort (the entity-level "jump to latest" guard already handles ordering correctly, so per-message FIFO isn't required).
+- **Visibility timeout** handles worker-crash recovery — no in-process reaper needed.
+- **DLQ at the LLM layer, not the receive layer.** A message can deserialize fine but fail downstream because the LLM timed out, hit a rate limit, or returned an unparseable response. After 3 LLM-side failures the worker explicitly publishes to the DLQ. This keeps the DLQ focused on real failures (bad payloads, prompt drift, novel vendor schemas) rather than transient infra noise.
+- DLQ visibility = `SELECT * FROM raw_events WHERE status = 'failed'` plus the SQS DLQ message body. No separate admin UI in v1; CloudWatch alarm on DLQ depth is the operator surface.
 
 ### Storage: RDS Postgres only
-- Entity store + raw payloads stay on Postgres (RDS) — same model as today, no separate object store.
-- The `raw_events` table already holds the verbatim payload as JSONB, which means **prompt / model upgrades can be replayed** straight from the DB into a shadow set of entities for diff before promotion. Adding S3 would be premature; revisit only if raw-payload retention starts dominating storage cost.
+Entity store + raw payloads stay on Postgres (RDS) — same model as
+today, no separate object store. The `raw_events` table already holds
+the verbatim payload as JSONB so **prompt / model upgrades replay
+straight from the DB** (see §6 schema-evolution story). Adding S3 would
+be premature; revisit only if raw-payload retention starts dominating
+storage cost.
+
+### Observability: CloudWatch for metrics + logs, OTEL → X-Ray for traces
+Two distinct stacks doing distinct things:
+- **CloudWatch** — structured app logs (already JSON via `structlog`) and metrics (queue depth, p99 ingest latency, DLQ count, classification confidence histogram). Native to AWS, alarming included.
+- **OpenTelemetry** spans the request lifecycle (POST → SQS receive → LLM call → DB write). Exported to X-Ray (or Honeycomb/Datadog if the org standardizes there). Diagnoses tail latency that aggregate metrics can't.
+
+CloudWatch is operator-facing; OTEL is engineer-facing. Keeping them
+separate avoids the trap of stuffing trace data into CloudWatch metrics
+where the high cardinality blows up the bill.
 
 ### Other production wiring
-- **HMAC verification** at the edge (per-vendor secret rotation via Secrets Manager).
-- **OpenTelemetry** end-to-end: trace from POST → SQS receive → LLM call → DB write. Metrics on classification confidence, dedupe rate, DLQ depth, p99 ingest latency.
-- **Per-vendor schema fast paths**: once a (vendor, shape) classification has been stable for N events, freeze it as a deterministic parser. LLM stays as the fallback for the long tail. Dramatically lowers token cost.
+- **Per-vendor schema fast paths**: once a (vendor, payload-shape) classification has been stable for N events, freeze it as a deterministic parser. LLM stays as the fallback for the long tail. Dramatically lowers token cost.
 - **Multi-key entity correlation**: a small `(vendor, alias, entity_id)` mapping table so the same logical shipment can be referenced by master BL early, house BL later, container number in some events — a real-world freight-forwarder pain point.
+
+---
+
+## 6. Failure modes & DLQ semantics
+
+Two distinct failure surfaces, with two distinct names:
+
+| Status        | Meaning | Visible to claim queue? | Operator query |
+| ---           | --- | :---: | --- |
+| `pending`     | Queued, attempts may be 0..max-1 | yes | `WHERE status='pending'` (queue depth) |
+| `processing` | A worker holds it; reaper will reset if `locked_at` falls behind. | no | (in-flight) |
+| `processed`   | Done. | no | (done) |
+| `duplicate`   | Byte-identical to an earlier `pending`/`processed` row. | no | `WHERE status='duplicate'` (audit) |
+| `failed`      | **Terminal DLQ.** `attempts >= max_attempts` real LLM/persist failures. Operator must intervene (typically `POST /raw-events/{id}/retry` after fixing the prompt). | no | `WHERE status='failed'` |
+
+The crucial split: `attempts` is incremented **only by `mark_failed`**
+(real classify or persist failure), NOT by `claim_one`. A worker crash
+between claim and persist costs zero retry budget — the reaper resets
+the row to `pending` and the next claim is "free". This means the DLQ
+budget actually counts LLM-side failures, not deploys-during-active-jobs.
+
+Reaper window math: LLM client `timeout=30s × max_retries=2` ⇒ ~90s
+worst-case LLM, plus ~1s persist ⇒ ~100s in-flight. Default
+`worker_stale_lock_minutes=5` (300s) gives a 3× margin. **If you raise
+the LLM timeout, raise the reaper window in lockstep** — they're a pair.
+
+---
+
+## 7. Schema evolution
+
+The system is event-sourced: `raw_events` is the journal, `*_events` is
+the typed event log, entity rows are projections. That makes most schema
+changes safer than they look — but only if you choose the right tool.
+
+| Change | What to do |
+| --- | --- |
+| Add an **optional** field to a payload variant | Just add it. JSONB readers tolerate the missing key on old rows; new events populate it from the LLM. No migration. |
+| Add a **mandatory** field (was optional, becoming required) | Old rows can violate the new contract. Either: backfill via the replay flow below, then tighten the schema; or accept that historical rows won't validate (read-only) and check on write only. |
+| Rename / split a field | Migration writes the new field from the old one in one tx; ship readers handling both for one release; drop the old field in the next. |
+| **Reclassify under a new prompt** | The replay flow: walk `raw_events` ASC by `received_at`, re-run the classifier into a **shadow** entity/event set, diff vs production, promote when satisfied. The verbatim payloads are still in `raw_events.payload` — that's why we keep them. The retry endpoint is the one-event version of the same flow. |
+| Bump the canonical-state vocabulary | Add the new state to `_PAYLOAD_BY_STATE` + a new payload variant; ship; then consider a backfill if you want historical rows reclassified. The `unclassified` bucket absorbs anything you don't reclassify. |
+
+What's **not** there yet: an explicit `events.schema_version` column. For
+the prototype, `_events.attributes` JSONB is permissive enough that
+additive evolution works without one. A v1 production system would add
+it the moment we ship a breaking change to a payload variant.

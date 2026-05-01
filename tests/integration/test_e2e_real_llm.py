@@ -112,27 +112,55 @@ SAMPLE_PAYLOADS = {
 }
 
 
-async def _seed(payload: dict, _key: str) -> RawEvent:
+async def _seed(payload: dict, vendor_hint: str) -> RawEvent:
     from app.utils.hashing import canonical_hash
 
     async with session_scope() as session:
-        re = RawEvent(payload=payload, vendor_hint="test", hash_exact=canonical_hash(payload))
+        re = RawEvent(payload=payload, vendor_hint=vendor_hint, hash_exact=canonical_hash(payload))
         session.add(re)
         await session.flush()
         await session.refresh(re)
         return re
 
 
+# Maps each sample to the URL path the vendor would actually POST to.
+# Both Maersk events go through /webhooks/maersk so they share the same
+# vendor namespace; both GFP events go through /webhooks/gfp; etc.
+_VENDOR_BY_NAME: dict[str, str] = {
+    "maersk_in_transit": "maersk",
+    "maersk_picked_up": "maersk",
+    "gfp_paid": "gfp",
+    "gfp_issued": "gfp",
+    "one_delivered": "oney",
+    "advisory_unclassified": "mta",
+}
+
+
 async def test_e2e_six_sample_payloads():
     settings = get_settings()
-    if not settings.google_api_key:
+    if settings.llm_provider == "anthropic" and not settings.anthropic_api_key:
+        pytest.skip("ANTHROPIC_API_KEY not set")
+    if settings.llm_provider == "google" and not settings.google_api_key:
         pytest.skip("GOOGLE_API_KEY not set")
     classifier = Classifier(build_llm(settings))
 
-    raws = {name: await _seed(p, f"e2e:{name}") for name, p in SAMPLE_PAYLOADS.items()}
+    raws = {name: await _seed(p, _VENDOR_BY_NAME[name]) for name, p in SAMPLE_PAYLOADS.items()}
 
+    # Production handles LLM-output noise (validation errors, missing required
+    # fields, occasional null-as-string) via the `failed` status + manual retry
+    # endpoint. This test mirrors that with an in-loop retry — up to 3 LLM
+    # calls per payload before treating it as a real failure.
     for name, payload in SAMPLE_PAYLOADS.items():
-        result = await classifier.classify(payload)
+        last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                result = await classifier.classify(payload)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise AssertionError(f"classifier failed 3x on {name}: {last_exc!r}") from last_exc
         async with session_scope() as session:
             row = await session.get(RawEvent, raws[name].id)
             assert row is not None

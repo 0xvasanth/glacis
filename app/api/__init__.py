@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import health, invoices, shipments, webhooks
+from app.api import health, invoices, raw_events, shipments, webhooks
 from app.core.config import get_settings
 from app.core.db import dispose_engine
 
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     app.include_router(webhooks.router, prefix="/api/v1")
     app.include_router(shipments.router, prefix="/api/v1")
     app.include_router(invoices.router, prefix="/api/v1")
+    app.include_router(raw_events.router, prefix="/api/v1")
     return app
 
 

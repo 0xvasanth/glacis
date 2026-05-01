@@ -24,6 +24,15 @@ class WebhookAck(BaseModel):
     duplicate_of: uuid.UUID | None = None
 
 
+class RawEventRetryResult(BaseModel):
+    raw_event_id: uuid.UUID
+    status: str
+    attempts: int
+    canonical_state: str | None
+    entity_type: str | None
+    last_error: str | None
+
+
 class EventOut(BaseModel):
     id: uuid.UUID
     canonical_state: str
