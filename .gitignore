@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# Type checkers
+.pyre/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# Secrets / env (envchain handles real secrets — these are belt-and-braces)
+.env
+.env.*
+!.env.example
+.envrc.local
+secrets.json
+*.pem
+*.key
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs & local data
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+.docker/
+
+# Misc
+*.bak
+*.tmp
+.cache/
