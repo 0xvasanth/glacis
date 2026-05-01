@@ -138,10 +138,8 @@ _VENDOR_BY_NAME: dict[str, str] = {
 
 async def test_e2e_six_sample_payloads():
     settings = get_settings()
-    if settings.llm_provider == "anthropic" and not settings.anthropic_api_key:
+    if not settings.anthropic_api_key:
         pytest.skip("ANTHROPIC_API_KEY not set")
-    if settings.llm_provider == "google" and not settings.google_api_key:
-        pytest.skip("GOOGLE_API_KEY not set")
     classifier = Classifier(build_llm(settings))
 
     raws = {name: await _seed(p, _VENDOR_BY_NAME[name]) for name, p in SAMPLE_PAYLOADS.items()}

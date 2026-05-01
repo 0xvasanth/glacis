@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-LLMProvider = Literal["google", "anthropic"]
 
 
 class Settings(BaseSettings):
@@ -14,16 +11,13 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://glacis:glacis@localhost:5432/glacis"
 
-    llm_provider: LLMProvider = Field(
-        default="google",
-        description="Which LLM backend to use. 'google' (Gemini) is cheap but its "
-        "responseSchema has partial oneOf support — discriminated unions can drop "
-        "per-variant required fields. 'anthropic' (Claude) honors the union schema "
-        "fully via tool-use. Recommended for production where strict schema "
-        "enforcement matters more than per-token cost.",
-    )
-    llm_model: str = "gemini-2.5-flash"
-    google_api_key: str = ""
+    # Anthropic Claude is the only LLM backend. Tool-use schemas honor the
+    # typed `NormalizedEvent` discriminated union (oneOf + per-variant
+    # required fields) faithfully — what we need for strict-schema
+    # enforcement. Default model is Sonnet — Haiku occasionally serializes
+    # nested tool-call objects as JSON strings; Sonnet returns them as
+    # proper objects so no extra parsing is needed.
+    llm_model: str = "claude-sonnet-4-6"
     anthropic_api_key: str = ""
 
     worker_poll_interval_s: float = 1.0
@@ -38,7 +32,7 @@ class Settings(BaseSettings):
         default=5,
         description="How old `locked_at` must be before the reaper resets a 'processing' "
         "row to 'pending'. Bound: must comfortably exceed the worst-case in-flight "
-        "duration. With Gemini timeout=30s x max_retries=2 → ~90s LLM, plus persist "
+        "duration. With Claude timeout=30s x max_retries=2 → ~90s LLM, plus persist "
         "tx ~1s, the worst case is ~100s. Default 5 min gives a 3x margin. "
         "If you raise the LLM timeout in the LangChain client, raise this too.",
     )

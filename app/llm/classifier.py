@@ -22,16 +22,6 @@ class Classifier:
     by `canonical_state`. Pydantic enforces required fields per state:
     if the LLM omits one, validation fires with "missing field X for
     state Y" and the worker parks the row in the DLQ.
-
-    Schema-handling notes per provider:
-      - Anthropic Claude — tool-use schemas honor JSON Schema `oneOf` +
-        per-variant `required` fields fully. Default `with_structured_output`
-        path works as-is.
-      - Google Gemini — `responseSchema` has partial `oneOf` support;
-        per-variant required fields don't always propagate, so the LLM
-        sometimes emits near-empty payloads. Production should use Claude
-        for this design; Gemini works for the cheap path with the caveat
-        documented in the README.
     """
 
     def __init__(self, llm: BaseChatModel):

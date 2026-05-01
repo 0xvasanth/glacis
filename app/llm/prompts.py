@@ -1,17 +1,4 @@
-"""System prompt for the LLM classifier.
-
-Deliberately minimal. The schema (the flat `_LLMOutput` Pydantic model
-the classifier sends to the LLM) carries the per-field contract via
-descriptions — the prompt only needs to set the overall task, the three
-classification buckets, and a handful of cross-cutting transformation
-rules that aren't expressible in JSON Schema (timezone math, European
-number parsing, "prefer Master BL").
-
-Avoid adding few-shot examples or per-vendor playbooks: they bias the
-model toward existing samples and break when a new vendor structure
-arrives. Trust the LLM, give it the typed schema, and intervene only
-when you observe a concrete failure.
-"""
+"""System prompt for the LLM classifier."""
 
 from __future__ import annotations
 

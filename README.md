@@ -18,7 +18,7 @@ flowchart LR
 
     V([Vendor]):::ext
     OP([Operator]):::ext
-    GEM([Gemini API]):::ext
+    GEM([Anthropic API]):::ext
 
     API[API processor<br/>FastAPI · ingest + read + retry]:::proc
     W[Worker processor<br/>async loop · classify + persist + reaper]:::proc
@@ -37,8 +37,8 @@ flowchart LR
 - **Vendor** — sends webhooks (any JSON shape) over HTTPS to the API.
 - **Operator** — humans / internal services that read entities and trigger manual retries.
 - **API processor** — FastAPI. Thin request path: hash + atomic INSERT to dedupe, return 202 in <100 ms. Also serves entity reads and the synchronous retry endpoint.
-- **Worker processor** — asyncio loop. Claims pending rows from Postgres with `FOR UPDATE SKIP LOCKED`, calls Gemini, persists the typed event in one transaction. A stale-claim reaper inside the same process recovers rows from worker crashes.
-- **Gemini API** — the LLM that classifies + normalizes the payload. Called by the worker on the normal path and by the API on the retry path.
+- **Worker processor** — asyncio loop. Claims pending rows from Postgres with `FOR UPDATE SKIP LOCKED`, calls Claude, persists the typed event in one transaction. A stale-claim reaper inside the same process recovers rows from worker crashes.
+- **Anthropic API** — the LLM that classifies + normalizes the payload. Called by the worker on the normal path and by the API on the retry path.
 - **Postgres** — the single shared dependency. All concurrency control (atomic claim, dedup, ordering guard) lives here as constraints + `SKIP LOCKED`, not as application-level locks.
 
 ---
@@ -138,7 +138,7 @@ sequenceDiagram
     participant API as FastAPI
     participant DB as Postgres
     participant W as Worker (async loop)
-    participant LLM as Gemini (LangChain)
+    participant LLM as Claude (LangChain)
 
     V->>+API: POST /api/v1/webhooks/{vendor} (any JSON)
     API->>API: compute hash_exact = SHA-256(canonical_json(payload))
@@ -311,7 +311,7 @@ without re-parsing the raw payload.
 ### Tech choices (last because they're swappable)
 - **Python + FastAPI + SQLAlchemy 2 + Pydantic** — a 3-hour build benefits more from the data/LLM ecosystem maturity than from raw performance gains we don't need yet.
 - **LangChain** — `with_structured_output(NormalizedEvent)` does the provider-agnostic JSON schema → tool-call wiring. Switching providers is a one-line change in `app/llm/__init__.py`.
-- **Google Gemini 2.5 Flash** — better at strict JSON/Decimal output than Claude or OpenAI at comparable cost, and much cheaper per token so retrying flaky payloads is affordable. Caveat: Gemini's structured output enforces JSON Schema `enum` but not `const`, and `const` is what Pydantic emits for single-value `Literal`s. Mitigation: the prompt explicitly lists the allowed `canonical_state` values; the test suite snapshot-asserts those listings stay in the prompt.
+- **Anthropic Claude (Haiku 4.5 default)** — its tool-use schema honors JSON Schema `oneOf` + per-variant `required` fields faithfully, which is the contract our typed `NormalizedEvent` discriminated union depends on. We tried Gemini first (cheaper per token) but its `responseSchema` drops per-variant required fields on union schemas — Claude was the right call once strict-schema enforcement mattered. Default to Haiku for the cheap path; bump `LLM_MODEL` to a Sonnet/Opus id when accuracy needs more headroom.
 - **Postgres-as-queue** — zero extra infra for the prototype; demonstrates the correct concurrency primitives. Replaced by SQS + DLQ in production (§4).
 
 ---
@@ -326,7 +326,7 @@ flowchart LR
     APIs --> RDS[(RDS Postgres<br/>raw_events + entities + event log)]
 
     SQS --> Workers[Worker fleet<br/>ECS Fargate]
-    Workers -->|classify| Gemini[Gemini API]
+    Workers -->|classify| Claude[Anthropic API]
     Workers --> RDS
 
     Workers -.->|"3 LLM-side failures"| DLQ[(SQS DLQ<br/>per source queue)]
